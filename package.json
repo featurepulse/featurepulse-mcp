@@ -1,6 +1,6 @@
 {
   "name": "featurepulse-mcp",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "MCP server for FeaturePulse — query feature requests, analyze MRR impact, and manage your roadmap from Claude, Cursor, or any MCP-compatible AI tool",
   "type": "module",
   "bin": {

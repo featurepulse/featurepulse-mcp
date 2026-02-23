@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import path from "path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -19,10 +20,51 @@ if (!API_KEY) {
   process.exit(1);
 }
 
+// ─── Project auto-detection ──────────────────────────────────────────────────
+
+interface ProjectEntry {
+  id: string;
+  name: string;
+}
+
+/** Parse projects out of the "Multiple projects found" error message. */
+function parseProjectsFromError(message: string): ProjectEntry[] {
+  const projects: ProjectEntry[] = [];
+  // Matches: Name With Spaces (uuid)
+  const re = /([^,(]+?)\s+\(([0-9a-f-]{36})\)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(message)) !== null) {
+    projects.push({ name: m[1].trim(), id: m[2] });
+  }
+  return projects;
+}
+
+function normalize(s: string): string {
+  return s.toLowerCase().replace(/[\s\-_]+/g, "");
+}
+
+/** Try to find a project whose name matches the current repo directory name. */
+function inferProjectId(projects: ProjectEntry[]): string | null {
+  const repoName = normalize(path.basename(process.cwd()));
+  for (const p of projects) {
+    if (normalize(p.name) === repoName) return p.id;
+  }
+  // Partial match fallback
+  for (const p of projects) {
+    const n = normalize(p.name);
+    if (repoName.includes(n) || n.includes(repoName)) return p.id;
+  }
+  return null;
+}
+
 // ─── HTTP helpers ────────────────────────────────────────────────────────────
 
-async function apiFetch(path: string, params?: Record<string, string>) {
-  const url = new URL(`${FEATUREPULSE_URL}/api/mcp${path}`);
+async function apiFetch(
+  endpoint: string,
+  params?: Record<string, string>,
+  _retry = true
+): Promise<any> {
+  const url = new URL(`${FEATUREPULSE_URL}/api/mcp${endpoint}`);
   if (params) {
     for (const [k, v] of Object.entries(params)) {
       if (v !== undefined && v !== "") url.searchParams.set(k, v);
@@ -34,8 +76,22 @@ async function apiFetch(path: string, params?: Record<string, string>) {
   });
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`FeaturePulse API error ${res.status}: ${text}`);
+    const json = await res.json().catch(() => null);
+    const message = json?.error ?? `HTTP ${res.status}`;
+
+    // Auto-detect project from repo name on multi-project errors
+    if (_retry && res.status === 400 && message.includes("Multiple projects")) {
+      const projects = parseProjectsFromError(message);
+      const inferredId = inferProjectId(projects);
+      if (inferredId) {
+        return apiFetch(endpoint, { ...params, project_id: inferredId }, false);
+      }
+    }
+
+    const err = new Error(message) as any;
+    err.apiJson = json;
+    err.status = res.status;
+    throw err;
   }
 
   return res.json();
@@ -217,12 +273,14 @@ function projectParam(args: Record<string, unknown>): Record<string, string> {
 }
 
 async function handleListProjects() {
-  // The API returns project info; we fetch stats which includes the project
-  // For multi-project support, we make a lightweight call
   try {
     const data = await apiFetch("/stats");
     return `## Your Project\n\n- **${data.project.name}** (ID: \`${data.project.id}\`)\n  - ${data.overview.total_feature_requests} feature requests, ${data.overview.total_votes} votes, $${data.overview.total_mrr.toFixed(2)}/mo MRR`;
-  } catch {
+  } catch (err: any) {
+    // When the API key has multiple projects, the 400 error includes the project list
+    if (err.status === 400 && err.apiJson?.error?.includes("Multiple projects")) {
+      return `## Your Projects\n\n${err.message}\n\nPass a \`project_id\` to other tools to target a specific project.`;
+    }
     return "Could not fetch projects. Make sure your API key is valid.";
   }
 }
